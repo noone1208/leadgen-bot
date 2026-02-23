@@ -149,9 +149,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 *Команди:*
 /setup — налаштувати моніторинг
 /status — поточні налаштування
-/start\_monitor — запустити моніторинг
-/stop\_monitor — зупинити моніторинг
-/mode — перемкнути режим (notify/auto\_send)
+/start\\_monitor — запустити моніторинг
+/stop\\_monitor — зупинити моніторинг
+/mode — перемкнути режим (notify/auto\\_send)
 /test — тестовий аналіз"""
     await update.message.reply_text(text, parse_mode="Markdown")
 
