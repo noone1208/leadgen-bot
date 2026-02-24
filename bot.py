@@ -2,12 +2,12 @@ import asyncio
 import logging
 import json
 import os
+import httpx
 from datetime import datetime
 from typing import Optional
-import praw
 import anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,205 +17,184 @@ logger = logging.getLogger(__name__)
 # ── Config ──────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
-REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 
-# User settings (persisted to settings.json)
 SETTINGS_FILE = "settings.json"
 DEFAULT_SETTINGS = {
-    "mode": "notify",           # "notify" | "auto_send"
-    "keywords": [],             # list of keywords to monitor
-    "subreddits": [],           # list of subreddits to monitor
-    "min_score": 0,             # minimum relevance score (0-10)
-    "your_product": "",         # what you're selling (for message generation)
-    "your_name": "",            # your name for personalization
-    "language": "en",           # language for generated messages
+    "mode": "notify",
+    "keywords": [],
+    "min_score": 6,
+    "your_product": "",
+    "your_name": "",
+    "language": "uk",
 }
 
 def load_settings() -> dict:
     if os.path.exists(SETTINGS_FILE):
         with open(SETTINGS_FILE) as f:
-            s = json.load(f)
-            return {**DEFAULT_SETTINGS, **s}
+            return {**DEFAULT_SETTINGS, **json.load(f)}
     return DEFAULT_SETTINGS.copy()
 
 def save_settings(settings: dict):
     with open(SETTINGS_FILE, "w") as f:
         json.dump(settings, f, indent=2, ensure_ascii=False)
 
-# Global state
 settings = load_settings()
 seen_posts = set()
 monitoring_task: Optional[asyncio.Task] = None
-app_instance = None
+
+# ── Apify Threads Search ──────────────────────────────────────────────────────
+async def search_threads(keyword: str) -> list:
+    """Search Threads posts by keyword via Apify."""
+    url = "https://api.apify.com/v2/acts/canadesk~threads/run-sync-get-dataset-items"
+    params = {"token": APIFY_TOKEN}
+    payload = {
+        "searchQueries": [keyword],
+        "searchType": "posts",
+        "resultsLimit": 20,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(url, params=params, json=payload)
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                logger.error(f"Apify error {resp.status_code}: {resp.text[:200]}")
+                return []
+    except Exception as e:
+        logger.error(f"Apify request failed: {e}")
+        return []
 
 # ── AI Analysis ──────────────────────────────────────────────────────────────
-def analyze_post(post_title: str, post_body: str, post_url: str,
-                 author_name: str, subreddit: str) -> dict:
-    """Analyze post + author with Claude, return structured insights."""
+def analyze_post(text: str, author: str, author_bio: str) -> dict:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    prompt = f"""You are a B2B sales intelligence analyst. Analyze this Threads post.
 
-    prompt = f"""You are a B2B sales intelligence analyst. Analyze this social media post and provide insights.
-
-POST DETAILS:
-- Subreddit: r/{subreddit}
-- Author: u/{author_name}
-- Title: {post_title}
-- Body: {post_body[:2000] if post_body else "(no body)"}
-- URL: {post_url}
-
+POST: {text[:1500]}
+AUTHOR: @{author}
+AUTHOR BIO: {author_bio or 'no bio'}
 PRODUCT/SERVICE BEING SOLD: {settings.get('your_product', 'not specified')}
 SELLER NAME: {settings.get('your_name', 'not specified')}
 
-Respond ONLY with valid JSON (no markdown, no explanation):
+Respond ONLY with valid JSON:
 {{
-  "relevance_score": <0-10, how relevant this lead is>,
-  "pain_points": ["<pain point 1>", "<pain point 2>"],
+  "relevance_score": <0-10>,
+  "pain_points": ["<pain 1>", "<pain 2>"],
   "author_insights": {{
-    "likely_role": "<guessed job title/role>",
+    "likely_role": "<role>",
     "company_stage": "<startup/smb/enterprise/unknown>",
-    "tech_savvy": "<low/medium/high>",
     "buying_intent": "<low/medium/high>",
-    "personality": "<brief 1-sentence personality read>"
+    "personality": "<1 sentence>"
   }},
-  "opportunity_summary": "<2-3 sentences: why this is a good lead and what they need>",
-  "outreach_message": "<personalized DM message, 3-5 sentences, human and warm, NOT salesy, reference their specific situation, offer value first. Language: {settings.get('language', 'en')}>"
+  "opportunity_summary": "<2-3 sentences why this is a good lead>",
+  "outreach_message": "<personalized DM, 3-4 sentences, warm and human, NOT salesy. Language: {settings.get('language', 'uk')}>"
 }}"""
 
-    message = client.messages.create(
+    msg = client.messages.create(
         model="claude-opus-4-6",
         max_tokens=1000,
         messages=[{"role": "user", "content": prompt}]
     )
-
     try:
-        return json.loads(message.content[0].text)
-    except json.JSONDecodeError:
-        # Fallback if JSON parsing fails
+        return json.loads(msg.content[0].text)
+    except Exception:
         return {
             "relevance_score": 5,
-            "pain_points": ["Unable to parse"],
-            "author_insights": {"likely_role": "unknown", "company_stage": "unknown",
-                                 "tech_savvy": "unknown", "buying_intent": "medium",
-                                 "personality": "unknown"},
-            "opportunity_summary": message.content[0].text[:300],
-            "outreach_message": "Hi! I saw your post and thought I could help..."
+            "pain_points": [],
+            "author_insights": {"likely_role": "?", "company_stage": "?", "buying_intent": "medium", "personality": "?"},
+            "opportunity_summary": msg.content[0].text[:300],
+            "outreach_message": "Hi! Saw your post and thought I could help."
         }
 
-# ── Telegram Message Formatting ───────────────────────────────────────────────
-def format_lead_message(post, analysis: dict) -> str:
+# ── Format Message ────────────────────────────────────────────────────────────
+def format_lead(post: dict, analysis: dict) -> str:
     score = analysis.get("relevance_score", 0)
     score_emoji = "🔥" if score >= 8 else "⚡" if score >= 6 else "📌"
     intent_emoji = {"high": "🎯", "medium": "👀", "low": "💤"}.get(
         analysis.get("author_insights", {}).get("buying_intent", "low"), "💤"
     )
-
-    pain_points = "\n".join(f"  • {p}" for p in analysis.get("pain_points", []))
     ai = analysis.get("author_insights", {})
+    pain_points = "\n".join(f"  • {p}" for p in analysis.get("pain_points", []))
+    author = post.get("username") or post.get("author", "unknown")
+    text = post.get("text") or post.get("caption") or ""
+    post_url = post.get("url") or f"https://www.threads.net/@{author}"
 
-    msg = f"""{score_emoji} *Новий лід знайдено!* [{score}/10]
+    return f"""{score_emoji} *Новий лід з Threads!* [{score}/10]
 
-📍 *r/{post.subreddit}* | [Відкрити пост]({post.url})
-👤 *u/{post.author}* {intent_emoji}
+👤 *@{author}* {intent_emoji} | [Відкрити пост]({post_url})
 
-📝 *{post.title[:100]}*
+📝 _{text[:200]}..._
 
 ━━━━━━━━━━━━━━
-🧠 *Інсайти про автора:*
+🧠 *Інсайти:*
   • Роль: {ai.get('likely_role', '?')}
   • Компанія: {ai.get('company_stage', '?')}
-  • Tech: {ai.get('tech_savvy', '?')}
   • Інтент: {ai.get('buying_intent', '?')}
   • {ai.get('personality', '')}
 
 💥 *Болі:*
 {pain_points}
 
-💡 *Чому це лід:*
+💡 *Чому лід:*
 {analysis.get('opportunity_summary', '')}
 
 ━━━━━━━━━━━━━━
-✉️ *Згенероване повідомлення:*
+✉️ *Повідомлення:*
 _{analysis.get('outreach_message', '')}_"""
-    return msg
 
 # ── Telegram Handlers ─────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = """🤖 *LeadGen Monitor Bot*
+    await update.message.reply_text("""🤖 *LeadGen Monitor Bot — Threads*
 
-Я моніторю Reddit і знаходжу потенційних клієнтів для тебе.
+Моніторю Threads і знаходжу B2B лідів.
 
 *Команди:*
-/setup — налаштувати моніторинг
-/status — поточні налаштування
-/start\\_monitor — запустити моніторинг
-/stop\\_monitor — зупинити моніторинг
-/mode — перемкнути режим (notify/auto\\_send)
-/test — тестовий аналіз"""
-    await update.message.reply_text(text, parse_mode="Markdown")
+/setup — налаштування
+/status — поточний стан
+/start\\_monitor — запустити
+/stop\\_monitor — зупинити
+/mode — notify / auto\\_send
+/test — тестовий аналіз""", parse_mode="Markdown")
 
 async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = """⚙️ *Налаштування*
-
-Надішли команди для конфігурації:
-
-`/set_keywords saas crm автоматизація` — ключові слова
-`/set_subreddits entrepreneur startups SaaS` — сабредіти
-`/set_product CRM для малого бізнесу` — що продаєш
-`/set_name Олексій` — твоє ім'я
-`/set_language uk` — мова повідомлень (uk/en)
-`/set_score 6` — мінімальний скор (0-10)"""
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text("""`/set_keywords crm saas автоматизація`
+`/set_product CRM для малого бізнесу`
+`/set_name Олексій`
+`/set_language uk`
+`/set_score 6`""", parse_mode="Markdown")
 
 async def set_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global settings
     if not context.args:
-        await update.message.reply_text("Використання: /set_keywords keyword1 keyword2")
+        await update.message.reply_text("Використання: /set_keywords слово1 слово2")
         return
     settings["keywords"] = context.args
     save_settings(settings)
     await update.message.reply_text(f"✅ Ключові слова: {', '.join(context.args)}")
 
-async def set_subreddits(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global settings
-    if not context.args:
-        await update.message.reply_text("Використання: /set_subreddits sub1 sub2")
-        return
-    settings["subreddits"] = context.args
-    save_settings(settings)
-    await update.message.reply_text(f"✅ Сабредіти: {', '.join(context.args)}")
-
 async def set_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global settings
-    if not context.args:
-        await update.message.reply_text("Використання: /set_product назва продукту")
-        return
     settings["your_product"] = " ".join(context.args)
     save_settings(settings)
     await update.message.reply_text(f"✅ Продукт: {settings['your_product']}")
 
 async def set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global settings
-    if not context.args:
-        await update.message.reply_text("Використання: /set_name Олексій")
-        return
     settings["your_name"] = " ".join(context.args)
     save_settings(settings)
     await update.message.reply_text(f"✅ Ім'я: {settings['your_name']}")
 
 async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global settings
-    lang = context.args[0] if context.args else "en"
-    settings["language"] = lang
+    settings["language"] = context.args[0] if context.args else "uk"
     save_settings(settings)
-    await update.message.reply_text(f"✅ Мова: {lang}")
+    await update.message.reply_text(f"✅ Мова: {settings['language']}")
 
 async def set_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global settings
     try:
-        score = int(context.args[0])
-        settings["min_score"] = max(0, min(10, score))
+        settings["min_score"] = max(0, min(10, int(context.args[0])))
         save_settings(settings)
         await update.message.reply_text(f"✅ Мінімальний скор: {settings['min_score']}")
     except (IndexError, ValueError):
@@ -224,158 +203,130 @@ async def set_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global monitoring_task
     is_running = monitoring_task and not monitoring_task.done()
-    mode_text = "📤 Авто-надсилання" if settings["mode"] == "auto_send" else "🔔 Тільки сповіщення"
-    status_text = "🟢 Активний" if is_running else "🔴 Зупинений"
+    await update.message.reply_text(f"""📊 *Статус*
 
-    text = f"""📊 *Статус моніторингу*
-
-{status_text}
-Режим: {mode_text}
+{'🟢 Активний' if is_running else '🔴 Зупинений'}
+Режим: {'📤 Авто' if settings['mode'] == 'auto_send' else '🔔 Notify'}
 Ключові слова: {', '.join(settings['keywords']) or 'не задані'}
-Сабредіти: {', '.join(settings['subreddits']) or 'не задані'}
 Продукт: {settings.get('your_product') or 'не задано'}
-Мінімальний скор: {settings['min_score']}/10
-Мова: {settings.get('language', 'en')}"""
-    await update.message.reply_text(text, parse_mode="Markdown")
+Мін. скор: {settings['min_score']}/10
+Мова: {settings.get('language', 'uk')}""", parse_mode="Markdown")
 
 async def toggle_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global settings
-    if settings["mode"] == "notify":
-        settings["mode"] = "auto_send"
-        text = "✅ Режим: *📤 Авто-надсилання*\nПовідомлення надсилатимуться автоматично в DM."
-    else:
-        settings["mode"] = "notify"
-        text = "✅ Режим: *🔔 Тільки сповіщення*\nТи будеш отримувати сповіщення і вирішувати самостійно."
+    settings["mode"] = "auto_send" if settings["mode"] == "notify" else "notify"
     save_settings(settings)
-    await update.message.reply_text(text, parse_mode="Markdown")
+    mode_text = "📤 Авто-надсилання" if settings["mode"] == "auto_send" else "🔔 Тільки сповіщення"
+    await update.message.reply_text(f"✅ Режим: *{mode_text}*", parse_mode="Markdown")
+
+async def test_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Запускаю тестовий аналіз...")
+    fake_post = {
+        "username": "startup_ceo_ua",
+        "text": "Шукаю нормальну CRM систему для нашої команди з 8 менеджерів. Зараз все в Excel і це жах. Бюджет є, головне щоб було просто і інтегрувалось з поштою.",
+        "url": "https://www.threads.net/@startup_ceo_ua"
+    }
+    loop = asyncio.get_event_loop()
+    analysis = await loop.run_in_executor(
+        None, analyze_post,
+        fake_post["text"], fake_post["username"], "CEO at startup | B2B"
+    )
+    if analysis["relevance_score"] >= settings["min_score"]:
+        msg = format_lead(fake_post, analysis)
+        keyboard = [[InlineKeyboardButton("👤 Профіль", url=f"https://www.threads.net/@{fake_post['username']}")]]
+        await update.message.reply_text(msg, parse_mode="Markdown",
+                                        reply_markup=InlineKeyboardMarkup(keyboard),
+                                        disable_web_page_preview=True)
+    else:
+        await update.message.reply_text(f"Скор {analysis['relevance_score']}/10 — нижче порогу {settings['min_score']}.")
 
 async def start_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global monitoring_task
-    if not settings["keywords"] or not settings["subreddits"]:
-        await update.message.reply_text("⚠️ Спочатку налаштуй /set_keywords та /set_subreddits")
+    if not settings["keywords"]:
+        await update.message.reply_text("⚠️ Спочатку задай /set_keywords")
         return
     if monitoring_task and not monitoring_task.done():
-        await update.message.reply_text("⚠️ Моніторинг вже запущений!")
+        await update.message.reply_text("⚠️ Вже запущено!")
         return
-
-    monitoring_task = asyncio.create_task(monitor_reddit(context.application))
-    await update.message.reply_text(
-        f"🟢 Моніторинг запущено!\n"
-        f"Слідкую за: {', '.join(settings['subreddits'])}\n"
-        f"Ключові слова: {', '.join(settings['keywords'])}"
-    )
+    monitoring_task = asyncio.create_task(monitor_threads(context.application))
+    await update.message.reply_text(f"🟢 Моніторинг запущено!\nКлючові слова: {', '.join(settings['keywords'])}")
 
 async def stop_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global monitoring_task
     if monitoring_task and not monitoring_task.done():
         monitoring_task.cancel()
-        await update.message.reply_text("🔴 Моніторинг зупинено.")
+        await update.message.reply_text("🔴 Зупинено.")
     else:
-        await update.message.reply_text("⚠️ Моніторинг не запущений.")
-
-async def test_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Аналізую тестовий пост...")
-
-    class FakePost:
-        title = "Looking for a CRM solution for our 5-person sales team - budget around $500/mo"
-        selftext = "We're a B2B SaaS startup, currently using spreadsheets but it's getting messy. Need something with email tracking and pipeline management."
-        url = "https://reddit.com/r/entrepreneur/test"
-        author = "startup_founder_99"
-        subreddit = "entrepreneur"
-
-    post = FakePost()
-    analysis = analyze_post(post.title, post.selftext, post.url, str(post.author), str(post.subreddit))
-
-    if analysis["relevance_score"] >= settings["min_score"]:
-        msg = format_lead_message(post, analysis)
-        keyboard = [
-            [InlineKeyboardButton("✉️ Скопіювати повідомлення", callback_data="copy_msg"),
-             InlineKeyboardButton("🔗 Відкрити профіль", url=f"https://reddit.com/u/{post.author}")]
-        ]
-        await update.message.reply_text(msg, parse_mode="Markdown",
-                                        reply_markup=InlineKeyboardMarkup(keyboard),
-                                        disable_web_page_preview=True)
-    else:
-        await update.message.reply_text(f"📉 Тестовий пост: скор {analysis['relevance_score']}/10 — нижче порогу {settings['min_score']}.")
+        await update.message.reply_text("⚠️ Не запущено.")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "copy_msg":
-        await query.message.reply_text("ℹ️ Повідомлення вже є в картці вище — просто скопіюй текст після ✉️")
+    await update.callback_query.answer()
 
-# ── Reddit Monitoring Loop ────────────────────────────────────────────────────
-async def monitor_reddit(app: Application):
-    reddit = praw.Reddit(
-        client_id=REDDIT_CLIENT_ID,
-        client_secret=REDDIT_CLIENT_SECRET,
-        user_agent="LeadGenBot/1.0"
-    )
-
-    logger.info(f"Starting Reddit monitor: {settings['subreddits']} | {settings['keywords']}")
-
+# ── Monitor Loop ──────────────────────────────────────────────────────────────
+async def monitor_threads(app: Application):
+    logger.info(f"Threads monitor started: {settings['keywords']}")
     while True:
         try:
-            subreddit_str = "+".join(settings["subreddits"])
-            subreddit = reddit.subreddit(subreddit_str)
+            for keyword in settings["keywords"]:
+                posts = await search_threads(keyword)
+                logger.info(f"Keyword '{keyword}': {len(posts)} posts found")
 
-            for post in subreddit.new(limit=25):
-                if post.id in seen_posts:
-                    continue
-                seen_posts.add(post.id)
+                for post in posts:
+                    post_id = post.get("id") or post.get("url") or str(post)[:50]
+                    if post_id in seen_posts:
+                        continue
+                    seen_posts.add(post_id)
 
-                # Check keyword match
-                text_to_search = (post.title + " " + (post.selftext or "")).lower()
-                if not any(kw.lower() in text_to_search for kw in settings["keywords"]):
-                    continue
+                    text = post.get("text") or post.get("caption") or ""
+                    if not text:
+                        continue
 
-                logger.info(f"Found matching post: {post.id} - {post.title[:60]}")
+                    author = post.get("username") or post.get("author", "unknown")
+                    bio = post.get("biography") or post.get("bio") or ""
 
-                # Run AI analysis in thread pool (praw is sync)
-                loop = asyncio.get_event_loop()
-                analysis = await loop.run_in_executor(
-                    None, analyze_post,
-                    post.title, post.selftext or "", post.url,
-                    str(post.author), str(post.subreddit)
-                )
-
-                if analysis["relevance_score"] < settings["min_score"]:
-                    logger.info(f"Post score {analysis['relevance_score']} below threshold, skipping")
-                    continue
-
-                msg = format_lead_message(post, analysis)
-                keyboard = [
-                    [InlineKeyboardButton("🔗 Відкрити пост", url=post.url),
-                     InlineKeyboardButton("👤 Профіль", url=f"https://reddit.com/u/{post.author}")]
-                ]
-
-                await app.bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=msg,
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    disable_web_page_preview=True
-                )
-
-                if settings["mode"] == "auto_send":
-                    await app.bot.send_message(
-                        chat_id=TELEGRAM_CHAT_ID,
-                        text=f"📤 *Авто-надсилання*\nПовідомлення готове для відправки u/{post.author}:\n\n`{analysis.get('outreach_message', '')}`",
-                        parse_mode="Markdown"
+                    loop = asyncio.get_event_loop()
+                    analysis = await loop.run_in_executor(
+                        None, analyze_post, text, author, bio
                     )
 
+                    if analysis["relevance_score"] < settings["min_score"]:
+                        continue
+
+                    msg = format_lead(post, analysis)
+                    post_url = post.get("url") or f"https://www.threads.net/@{author}"
+                    keyboard = [[
+                        InlineKeyboardButton("🔗 Пост", url=post_url),
+                        InlineKeyboardButton("👤 Профіль", url=f"https://www.threads.net/@{author}")
+                    ]]
+
+                    await app.bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=msg,
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        disable_web_page_preview=True
+                    )
+
+                    if settings["mode"] == "auto_send":
+                        await app.bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text=f"📤 Готове повідомлення для @{author}:\n\n`{analysis.get('outreach_message', '')}`",
+                            parse_mode="Markdown"
+                        )
+
+                await asyncio.sleep(10)
+
         except asyncio.CancelledError:
-            logger.info("Monitor cancelled")
+            logger.info("Monitor stopped")
             break
         except Exception as e:
             logger.error(f"Monitor error: {e}")
 
-        await asyncio.sleep(60)  # Check every minute
+        await asyncio.sleep(300)  # перевірка кожні 5 хвилин
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setup", setup))
     app.add_handler(CommandHandler("status", status))
@@ -384,13 +335,11 @@ def main():
     app.add_handler(CommandHandler("stop_monitor", stop_monitor))
     app.add_handler(CommandHandler("test", test_analysis))
     app.add_handler(CommandHandler("set_keywords", set_keywords))
-    app.add_handler(CommandHandler("set_subreddits", set_subreddits))
     app.add_handler(CommandHandler("set_product", set_product))
     app.add_handler(CommandHandler("set_name", set_name))
     app.add_handler(CommandHandler("set_language", set_language))
     app.add_handler(CommandHandler("set_score", set_score))
     app.add_handler(CallbackQueryHandler(button_callback))
-
     logger.info("Bot started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
