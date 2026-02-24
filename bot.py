@@ -112,6 +112,12 @@ Respond ONLY with valid JSON, no markdown:
         }
 
 # ── Format ────────────────────────────────────────────────────────────────────
+def clean_text(s: str) -> str:
+    """Remove markdown special chars to avoid Telegram parse errors."""
+    for ch in ['_', '*', '[', ']', '`', '~']:
+        s = s.replace(ch, '')
+    return s
+
 def format_lead(post: dict, analysis: dict) -> str:
     score = analysis.get("relevance_score", 0)
     score_emoji = "🔥" if score >= 8 else "⚡" if score >= 6 else "📌"
@@ -119,34 +125,37 @@ def format_lead(post: dict, analysis: dict) -> str:
         analysis.get("author_insights", {}).get("buying_intent", "low"), "💤"
     )
     ai = analysis.get("author_insights", {})
-    pain_points = "\n".join(f"  • {p}" for p in analysis.get("pain_points", []))
-    author = post.get("author") or post.get("author_name") or "unknown"
-    text = post.get("text") or ""
+    pain_points = "\n".join(f"  • {clean_text(p)}" for p in analysis.get("pain_points", []))
+    author = clean_text(post.get("author") or post.get("author_name") or "unknown")
+    text = clean_text(post.get("text") or "")
     post_url = post.get("url") or f"https://www.threads.net/@{author}"
+    summary = clean_text(analysis.get("opportunity_summary", ""))
+    outreach = clean_text(analysis.get("outreach_message", ""))
+    personality = clean_text(ai.get("personality", ""))
 
-    return f"""{score_emoji} *Новий лід з Threads!* \[{score}/10\]
+    return f"""{score_emoji} Новий лід з Threads! [{score}/10]
 
-👤 *@{author}* {intent_emoji}
-[Відкрити пост]({post_url})
+👤 @{author} {intent_emoji}
+{post_url}
 
-📝 _{text[:250]}_
+📝 {text[:300]}
 
 ━━━━━━━━━━━━━━
-🧠 *Інсайти:*
-  • Роль: {ai.get('likely_role', '?')}
-  • Компанія: {ai.get('company_stage', '?')}
-  • Інтент: {ai.get('buying_intent', '?')}
-  • {ai.get('personality', '')}
+🧠 Інсайти:
+  • Роль: {ai.get("likely_role", "?")}
+  • Компанія: {ai.get("company_stage", "?")}
+  • Інтент: {ai.get("buying_intent", "?")}
+  • {personality}
 
-💥 *Болі:*
+💥 Болі:
 {pain_points}
 
-💡 *Чому лід:*
-{analysis.get('opportunity_summary', '')}
+💡 Чому лід:
+{summary}
 
 ━━━━━━━━━━━━━━
-✉️ *Готове повідомлення:*
-_{analysis.get('outreach_message', '')}_"""
+✉️ Готове повідомлення:
+{outreach}"""
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -309,7 +318,6 @@ async def monitor_loop(app: Application):
                 await app.bot.send_message(
                     chat_id=TELEGRAM_CHAT_ID,
                     text=msg,
-                    parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup(keyboard),
                     disable_web_page_preview=True
                 )
