@@ -44,23 +44,53 @@ monitoring_task: Optional[asyncio.Task] = None
 
 # ── Apify Search ──────────────────────────────────────────────────────────────
 async def search_threads(keywords: list) -> list:
-    url = "https://api.apify.com/v2/acts/watcher.data~search-threads-by-keywords/run-sync-get-dataset-items"
+    # Step 1: Start the run
+    run_url = "https://api.apify.com/v2/acts/watcher.data~search-threads-by-keywords/runs"
     payload = {
         "keywords": keywords,
-        "maxItemsPerKeyword": 15,
+        "maxItemsPerKeyword": 10,
         "sortByRecent": True,
     }
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=180) as client:
+            # Start run
             resp = await client.post(
-                url,
+                run_url,
                 params={"token": APIFY_TOKEN},
                 json=payload
             )
-            if resp.status_code == 200:
-                return resp.json()
+            if resp.status_code not in (200, 201):
+                logger.error(f"Apify start error {resp.status_code}: {resp.text[:300]}")
+                return []
+            
+            run_id = resp.json()["data"]["id"]
+            logger.info(f"Apify run started: {run_id}")
+            
+            # Step 2: Wait for run to finish
+            for _ in range(30):  # max 60 seconds
+                await asyncio.sleep(2)
+                status_resp = await client.get(
+                    f"https://api.apify.com/v2/acts/watcher.data~search-threads-by-keywords/runs/{run_id}",
+                    params={"token": APIFY_TOKEN}
+                )
+                status = status_resp.json()["data"]["status"]
+                logger.info(f"Apify run status: {status}")
+                if status == "SUCCEEDED":
+                    break
+                elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
+                    logger.error(f"Apify run failed: {status}")
+                    return []
+            
+            # Step 3: Get results
+            dataset_id = status_resp.json()["data"]["defaultDatasetId"]
+            results_resp = await client.get(
+                f"https://api.apify.com/v2/datasets/{dataset_id}/items",
+                params={"token": APIFY_TOKEN, "format": "json"}
+            )
+            if results_resp.status_code == 200:
+                return results_resp.json()
             else:
-                logger.error(f"Apify error {resp.status_code}: {resp.text[:300]}")
+                logger.error(f"Apify results error: {results_resp.status_code}")
                 return []
     except Exception as e:
         logger.error(f"Apify request failed: {e}")
