@@ -3,7 +3,6 @@ import logging
 import json
 import os
 import httpx
-from datetime import datetime
 from typing import Optional
 import anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,7 +13,6 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ── Config ──────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -24,7 +22,7 @@ SETTINGS_FILE = "settings.json"
 DEFAULT_SETTINGS = {
     "mode": "notify",
     "keywords": [],
-    "min_score": 6,
+    "min_score": 5,
     "your_product": "",
     "your_name": "",
     "language": "uk",
@@ -44,23 +42,25 @@ settings = load_settings()
 seen_posts = set()
 monitoring_task: Optional[asyncio.Task] = None
 
-# ── Apify Threads Search ──────────────────────────────────────────────────────
-async def search_threads(keyword: str) -> list:
-    """Search Threads posts by keyword via Apify."""
-    url = "https://api.apify.com/v2/acts/canadesk~threads/run-sync-get-dataset-items"
-    params = {"token": APIFY_TOKEN}
+# ── Apify Search ──────────────────────────────────────────────────────────────
+async def search_threads(keywords: list) -> list:
+    url = "https://api.apify.com/v2/acts/watcher.data~search-threads-by-keywords/run-sync-get-dataset-items"
     payload = {
-        "searchQueries": [keyword],
-        "searchType": "posts",
-        "resultsLimit": 20,
+        "keywords": keywords,
+        "maxItemsPerKeyword": 15,
+        "sortByRecent": True,
     }
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(url, params=params, json=payload)
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                url,
+                params={"token": APIFY_TOKEN},
+                json=payload
+            )
             if resp.status_code == 200:
                 return resp.json()
             else:
-                logger.error(f"Apify error {resp.status_code}: {resp.text[:200]}")
+                logger.error(f"Apify error {resp.status_code}: {resp.text[:300]}")
                 return []
     except Exception as e:
         logger.error(f"Apify request failed: {e}")
@@ -69,26 +69,27 @@ async def search_threads(keyword: str) -> list:
 # ── AI Analysis ──────────────────────────────────────────────────────────────
 def analyze_post(text: str, author: str, author_bio: str) -> dict:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    prompt = f"""You are a B2B sales intelligence analyst. Analyze this Threads post.
+    prompt = f"""You are a B2B sales intelligence analyst. Analyze this Threads post to determine if it's a good lead.
 
-POST: {text[:1500]}
-AUTHOR: @{author}
+POST TEXT: {text[:1500]}
+AUTHOR USERNAME: @{author}
 AUTHOR BIO: {author_bio or 'no bio'}
-PRODUCT/SERVICE BEING SOLD: {settings.get('your_product', 'not specified')}
+
+WHAT WE SELL: {settings.get('your_product', 'not specified')}
 SELLER NAME: {settings.get('your_name', 'not specified')}
 
-Respond ONLY with valid JSON:
+Respond ONLY with valid JSON, no markdown:
 {{
-  "relevance_score": <0-10>,
-  "pain_points": ["<pain 1>", "<pain 2>"],
+  "relevance_score": <0-10, how likely this person needs our service>,
+  "pain_points": ["<specific pain 1>", "<specific pain 2>"],
   "author_insights": {{
-    "likely_role": "<role>",
-    "company_stage": "<startup/smb/enterprise/unknown>",
+    "likely_role": "<guessed role>",
+    "company_stage": "<startup/smb/enterprise/individual/unknown>",
     "buying_intent": "<low/medium/high>",
-    "personality": "<1 sentence>"
+    "personality": "<1 sentence personality read>"
   }},
-  "opportunity_summary": "<2-3 sentences why this is a good lead>",
-  "outreach_message": "<personalized DM, 3-4 sentences, warm and human, NOT salesy. Language: {settings.get('language', 'uk')}>"
+  "opportunity_summary": "<2-3 sentences: why this is a good lead>",
+  "outreach_message": "<personalized DM, 3-4 sentences, warm and human, NOT salesy, reference their specific situation. Write in: {settings.get('language', 'uk')}>"
 }}"""
 
     msg = client.messages.create(
@@ -102,12 +103,15 @@ Respond ONLY with valid JSON:
         return {
             "relevance_score": 5,
             "pain_points": [],
-            "author_insights": {"likely_role": "?", "company_stage": "?", "buying_intent": "medium", "personality": "?"},
+            "author_insights": {
+                "likely_role": "?", "company_stage": "?",
+                "buying_intent": "medium", "personality": "?"
+            },
             "opportunity_summary": msg.content[0].text[:300],
-            "outreach_message": "Hi! Saw your post and thought I could help."
+            "outreach_message": "Привіт! Бачив твій пост і подумав що можу допомогти."
         }
 
-# ── Format Message ────────────────────────────────────────────────────────────
+# ── Format ────────────────────────────────────────────────────────────────────
 def format_lead(post: dict, analysis: dict) -> str:
     score = analysis.get("relevance_score", 0)
     score_emoji = "🔥" if score >= 8 else "⚡" if score >= 6 else "📌"
@@ -116,15 +120,16 @@ def format_lead(post: dict, analysis: dict) -> str:
     )
     ai = analysis.get("author_insights", {})
     pain_points = "\n".join(f"  • {p}" for p in analysis.get("pain_points", []))
-    author = post.get("username") or post.get("author", "unknown")
-    text = post.get("text") or post.get("caption") or ""
+    author = post.get("author") or post.get("author_name") or "unknown"
+    text = post.get("text") or ""
     post_url = post.get("url") or f"https://www.threads.net/@{author}"
 
-    return f"""{score_emoji} *Новий лід з Threads!* [{score}/10]
+    return f"""{score_emoji} *Новий лід з Threads!* \[{score}/10\]
 
-👤 *@{author}* {intent_emoji} | [Відкрити пост]({post_url})
+👤 *@{author}* {intent_emoji}
+[Відкрити пост]({post_url})
 
-📝 _{text[:200]}..._
+📝 _{text[:250]}_
 
 ━━━━━━━━━━━━━━
 🧠 *Інсайти:*
@@ -140,34 +145,34 @@ def format_lead(post: dict, analysis: dict) -> str:
 {analysis.get('opportunity_summary', '')}
 
 ━━━━━━━━━━━━━━
-✉️ *Повідомлення:*
+✉️ *Готове повідомлення:*
 _{analysis.get('outreach_message', '')}_"""
 
-# ── Telegram Handlers ─────────────────────────────────────────────────────────
+# ── Handlers ──────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("""🤖 *LeadGen Monitor Bot — Threads*
 
-Моніторю Threads і знаходжу B2B лідів.
+Моніторю Threads і знаходжу B2B лідів по твоїх ключових словах.
 
 *Команди:*
-/setup — налаштування
+/setup — як налаштувати
 /status — поточний стан
-/start\\_monitor — запустити
+/start\\_monitor — запустити моніторинг
 /stop\\_monitor — зупинити
 /mode — notify / auto\\_send
 /test — тестовий аналіз""", parse_mode="Markdown")
 
 async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("""`/set_keywords crm saas автоматизація`
-`/set_product CRM для малого бізнесу`
-`/set_name Олексій`
-`/set_language uk`
-`/set_score 6`""", parse_mode="Markdown")
+    await update.message.reply_text("""`/set_product веб-дизайн послуги`
+`/set_name Олександр`
+`/set_keywords web designer ux designer`
+`/set_score 5`
+`/set_language uk`""", parse_mode="Markdown")
 
 async def set_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global settings
     if not context.args:
-        await update.message.reply_text("Використання: /set_keywords слово1 слово2")
+        await update.message.reply_text("Використання: /set\\_keywords слово1 слово2", parse_mode="Markdown")
         return
     settings["keywords"] = context.args
     save_settings(settings)
@@ -198,7 +203,7 @@ async def set_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_settings(settings)
         await update.message.reply_text(f"✅ Мінімальний скор: {settings['min_score']}")
     except (IndexError, ValueError):
-        await update.message.reply_text("Використання: /set_score 6")
+        await update.message.reply_text("Використання: /set\\_score 5", parse_mode="Markdown")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global monitoring_task
@@ -206,7 +211,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"""📊 *Статус*
 
 {'🟢 Активний' if is_running else '🔴 Зупинений'}
-Режим: {'📤 Авто' if settings['mode'] == 'auto_send' else '🔔 Notify'}
+Режим: {'📤 Авто-надсилання' if settings['mode'] == 'auto_send' else '🔔 Тільки сповіщення'}
 Ключові слова: {', '.join(settings['keywords']) or 'не задані'}
 Продукт: {settings.get('your_product') or 'не задано'}
 Мін. скор: {settings['min_score']}/10
@@ -222,107 +227,109 @@ async def toggle_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def test_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Запускаю тестовий аналіз...")
     fake_post = {
-        "username": "startup_ceo_ua",
-        "text": "Шукаю нормальну CRM систему для нашої команди з 8 менеджерів. Зараз все в Excel і це жах. Бюджет є, головне щоб було просто і інтегрувалось з поштою.",
+        "author": "startup_ceo_ua",
+        "author_name": "Олег | CEO",
+        "text": "Шукаю веб дизайнера для редизайну нашого сайту. Є бюджет, потрібен хтось хто розуміє B2B і може зробити лендінг що конвертує. DM якщо є досвід.",
         "url": "https://www.threads.net/@startup_ceo_ua"
     }
     loop = asyncio.get_event_loop()
     analysis = await loop.run_in_executor(
         None, analyze_post,
-        fake_post["text"], fake_post["username"], "CEO at startup | B2B"
+        fake_post["text"], fake_post["author"], "CEO at B2B startup"
     )
-    if analysis["relevance_score"] >= settings["min_score"]:
-        msg = format_lead(fake_post, analysis)
-        keyboard = [[InlineKeyboardButton("👤 Профіль", url=f"https://www.threads.net/@{fake_post['username']}")]]
-        await update.message.reply_text(msg, parse_mode="Markdown",
-                                        reply_markup=InlineKeyboardMarkup(keyboard),
-                                        disable_web_page_preview=True)
-    else:
-        await update.message.reply_text(f"Скор {analysis['relevance_score']}/10 — нижче порогу {settings['min_score']}.")
+    msg = format_lead(fake_post, analysis)
+    keyboard = [[InlineKeyboardButton("👤 Профіль", url=f"https://www.threads.net/@{fake_post['author']}")]]
+    await update.message.reply_text(
+        msg, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True
+    )
 
 async def start_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global monitoring_task
     if not settings["keywords"]:
-        await update.message.reply_text("⚠️ Спочатку задай /set_keywords")
+        await update.message.reply_text("⚠️ Спочатку задай /set\\_keywords", parse_mode="Markdown")
         return
     if monitoring_task and not monitoring_task.done():
         await update.message.reply_text("⚠️ Вже запущено!")
         return
-    monitoring_task = asyncio.create_task(monitor_threads(context.application))
-    await update.message.reply_text(f"🟢 Моніторинг запущено!\nКлючові слова: {', '.join(settings['keywords'])}")
+    monitoring_task = asyncio.create_task(monitor_loop(context.application))
+    await update.message.reply_text(
+        f"🟢 Моніторинг запущено!\nКлючові слова: {', '.join(settings['keywords'])}\nПеревірка кожні 10 хвилин."
+    )
 
 async def stop_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global monitoring_task
     if monitoring_task and not monitoring_task.done():
         monitoring_task.cancel()
-        await update.message.reply_text("🔴 Зупинено.")
+        await update.message.reply_text("🔴 Моніторинг зупинено.")
     else:
-        await update.message.reply_text("⚠️ Не запущено.")
+        await update.message.reply_text("⚠️ Моніторинг не запущений.")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
 
 # ── Monitor Loop ──────────────────────────────────────────────────────────────
-async def monitor_threads(app: Application):
-    logger.info(f"Threads monitor started: {settings['keywords']}")
+async def monitor_loop(app: Application):
+    logger.info(f"Monitor started: {settings['keywords']}")
     while True:
         try:
-            for keyword in settings["keywords"]:
-                posts = await search_threads(keyword)
-                logger.info(f"Keyword '{keyword}': {len(posts)} posts found")
+            posts = await search_threads(settings["keywords"])
+            logger.info(f"Found {len(posts)} posts")
 
-                for post in posts:
-                    post_id = post.get("id") or post.get("url") or str(post)[:50]
-                    if post_id in seen_posts:
-                        continue
-                    seen_posts.add(post_id)
+            for post in posts:
+                post_id = post.get("id") or post.get("url") or str(post.get("text", ""))[:80]
+                if post_id in seen_posts:
+                    continue
+                seen_posts.add(post_id)
 
-                    text = post.get("text") or post.get("caption") or ""
-                    if not text:
-                        continue
+                text = post.get("text") or ""
+                if not text or len(text) < 20:
+                    continue
 
-                    author = post.get("username") or post.get("author", "unknown")
-                    bio = post.get("biography") or post.get("bio") or ""
+                author = post.get("author") or post.get("author_name") or "unknown"
+                bio = post.get("biography") or post.get("bio") or ""
 
-                    loop = asyncio.get_event_loop()
-                    analysis = await loop.run_in_executor(
-                        None, analyze_post, text, author, bio
-                    )
+                loop = asyncio.get_event_loop()
+                analysis = await loop.run_in_executor(
+                    None, analyze_post, text, author, bio
+                )
 
-                    if analysis["relevance_score"] < settings["min_score"]:
-                        continue
+                if analysis["relevance_score"] < settings["min_score"]:
+                    logger.info(f"Skip post by @{author}: score {analysis['relevance_score']}")
+                    continue
 
-                    msg = format_lead(post, analysis)
-                    post_url = post.get("url") or f"https://www.threads.net/@{author}"
-                    keyboard = [[
-                        InlineKeyboardButton("🔗 Пост", url=post_url),
-                        InlineKeyboardButton("👤 Профіль", url=f"https://www.threads.net/@{author}")
-                    ]]
+                msg = format_lead(post, analysis)
+                post_url = post.get("url") or f"https://www.threads.net/@{author}"
+                keyboard = [[
+                    InlineKeyboardButton("🔗 Пост", url=post_url),
+                    InlineKeyboardButton("👤 Профіль", url=f"https://www.threads.net/@{author}")
+                ]]
 
+                await app.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=msg,
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    disable_web_page_preview=True
+                )
+
+                if settings["mode"] == "auto_send":
                     await app.bot.send_message(
                         chat_id=TELEGRAM_CHAT_ID,
-                        text=msg,
-                        parse_mode="Markdown",
-                        reply_markup=InlineKeyboardMarkup(keyboard),
-                        disable_web_page_preview=True
+                        text=f"📤 Повідомлення для @{author}:\n\n`{analysis.get('outreach_message', '')}`",
+                        parse_mode="Markdown"
                     )
 
-                    if settings["mode"] == "auto_send":
-                        await app.bot.send_message(
-                            chat_id=TELEGRAM_CHAT_ID,
-                            text=f"📤 Готове повідомлення для @{author}:\n\n`{analysis.get('outreach_message', '')}`",
-                            parse_mode="Markdown"
-                        )
-
-                await asyncio.sleep(10)
+                await asyncio.sleep(2)
 
         except asyncio.CancelledError:
-            logger.info("Monitor stopped")
+            logger.info("Monitor cancelled")
             break
         except Exception as e:
             logger.error(f"Monitor error: {e}")
 
-        await asyncio.sleep(300)  # перевірка кожні 5 хвилин
+        await asyncio.sleep(600)  # 10 хвилин
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
