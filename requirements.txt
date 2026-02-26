@@ -3,4 +3,4 @@ anthropic==0.25.0
 python-dotenv==1.0.0
 httpx==0.24.1
 playwright==1.41.0
-greenlet==3.0.3 --only-binary=:all:
+greenlet==3.2.2
