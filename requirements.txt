@@ -2,5 +2,4 @@ python-telegram-bot==20.3
 anthropic==0.25.0
 python-dotenv==1.0.0
 httpx==0.24.1
-playwright==1.41.0
-greenlet==3.2.2
+playwright==1.49.0
