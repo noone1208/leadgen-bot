@@ -431,7 +431,7 @@ def main():
     app.add_handler(CommandHandler("set_score", set_score))
     app.add_handler(CallbackQueryHandler(button_callback))
     logger.info("Bot started!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
