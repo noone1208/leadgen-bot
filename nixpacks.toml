@@ -1,11 +1,9 @@
 [phases.setup]
-nixPkgs = ["playwright-driver", "python311"]
+nixPkgs = ["python311"]
+aptPkgs = ["libnss3", "libatk1.0-0", "libatk-bridge2.0-0", "libcups2", "libdrm2", "libxkbcommon0", "libxcomposite1", "libxdamage1", "libxfixes3", "libxrandr2", "libgbm1", "libasound2", "libx11-6", "libxcb1", "libxext6"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
-
-[phases.build]
-cmds = ["playwright install --with-deps chromium"]
+cmds = ["pip install -r requirements.txt", "playwright install chromium"]
 
 [start]
 cmd = "python bot.py"
