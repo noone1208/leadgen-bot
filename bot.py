@@ -4,6 +4,8 @@ import json
 import os
 import re
 import random
+import subprocess
+import sys
 from typing import Optional
 import anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,6 +16,25 @@ from playwright.async_api import async_playwright
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+def ensure_playwright_browser():
+    """Install Playwright Chromium browser if not already present."""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            browser.close()
+    except Exception as e:
+        if "Executable doesn't exist" in str(e) or "playwright install" in str(e):
+            logger.info("Playwright browser not found. Installing Chromium...")
+            result = subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "chromium"],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                logger.info("Playwright Chromium installed successfully.")
+            else:
+                logger.error(f"Failed to install Playwright Chromium: {result.stderr}")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -394,6 +415,7 @@ async def monitor_loop(app: Application):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    ensure_playwright_browser()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setup", setup))
